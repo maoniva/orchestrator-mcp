@@ -43,6 +43,10 @@ describe("LocalGitWorktreePreparer", () => {
 
     const created = await preparer.prepare(input);
     const adopted = await preparer.prepare(input);
+    const adoptedByPath = await preparer.adopt({
+      projectCwd: repo,
+      worktreePath: created.path,
+    });
 
     expect(created).toEqual({
       path: path.join(worktreesDir, "sample-repo", "agent-diagnostic"),
@@ -50,8 +54,15 @@ describe("LocalGitWorktreePreparer", () => {
       disposition: "created",
     });
     expect(adopted).toEqual({ ...created, disposition: "adopted" });
+    expect(adoptedByPath).toEqual({ ...created, disposition: "adopted" });
     expect(git(created.path, "branch", "--show-current")).toBe("agent/diagnostic");
     expect(git(created.path, "rev-parse", "HEAD")).toBe(git(repo, "rev-parse", "main"));
+    await expect(
+      preparer.adopt({ projectCwd: repo, worktreePath: repo }),
+    ).rejects.toThrow("primary checkout");
+    await expect(
+      preparer.adopt({ projectCwd: repo, worktreePath: "agent-diagnostic" }),
+    ).rejects.toThrow("must be absolute");
   });
 
   it("rejects origin mode before running git", async () => {

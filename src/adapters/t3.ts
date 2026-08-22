@@ -14,6 +14,8 @@ import type {
 } from "../t3/types.js";
 import type {
   FollowUpInput,
+  MoveThreadInput,
+  MoveThreadResult,
   ProjectSummary,
   ProviderSummary,
   SpawnThreadInput,
@@ -708,6 +710,71 @@ export class T3Adapter implements ThreadPlatformAdapter {
     }
   }
 
+  async moveThread(input: MoveThreadInput): Promise<MoveThreadResult> {
+    const descriptor = await this.#client.getDescriptor();
+    const status = await this.#loadThreadStatus(input.threadId, descriptor.environmentId, false);
+    if (status.archived) {
+      throw new OrchestratorError(
+        "THREAD_ARCHIVED",
+        `Unarchive thread '${input.threadId}' before moving it to another worktree.`,
+      );
+    }
+
+    const snapshot = await this.#client.getShellSnapshot();
+    const project = snapshot.projects.find((candidate) => candidate.id === status.projectId);
+    if (!project) {
+      throw new OrchestratorError(
+        "PROJECT_NOT_FOUND",
+        `Project '${status.projectId}' for thread '${input.threadId}' is not visible.`,
+      );
+    }
+    const target = await this.#worktrees.adopt({
+      projectCwd: project.workspaceRoot,
+      worktreePath: input.worktreePath,
+    });
+    const inFlightTurn =
+      status.latestTurn?.state === "running" || (status.session?.activeTurnId ?? null) !== null;
+    const toResult = (
+      dispatchSequence: number | null,
+      deduplicated: boolean,
+    ): MoveThreadResult => ({
+      platform: this.id,
+      environmentId: descriptor.environmentId,
+      projectId: status.projectId,
+      threadId: status.threadId,
+      previousBranch: status.branch,
+      previousWorktreePath: status.worktreePath,
+      branch: target.branch,
+      worktreePath: target.path,
+      worktreeDisposition: "adopted",
+      dispatchSequence,
+      deduplicated,
+      inFlightTurnUnaffected: inFlightTurn,
+      deepLink: status.deepLink,
+    });
+
+    if (status.branch === target.branch && status.worktreePath === target.path) {
+      return toResult(null, true);
+    }
+    const result = await this.#client.dispatch({
+      type: "thread.meta.update",
+      commandId: deterministicUuid(
+        "orchestrator-mcp:t3:move-thread-command",
+        `${input.threadId}\0${input.idempotencyKey}`,
+      ),
+      threadId: input.threadId,
+      branch: target.branch,
+      worktreePath: target.path,
+    });
+    await this.#awaitThreadWorkspace(
+      input.threadId,
+      descriptor.environmentId,
+      target.branch,
+      target.path,
+    );
+    return toResult(result.sequence, false);
+  }
+
   async sendFollowUp(input: FollowUpInput): Promise<ThreadCommandResult> {
     const status = await this.getThreadStatus(input.threadId, false);
     if (status.archived) {
@@ -1044,6 +1111,34 @@ export class T3Adapter implements ThreadPlatformAdapter {
       }
       await new Promise((resolve) => setTimeout(resolve, Math.min(250, remainingMs)));
       thread = null;
+    }
+  }
+
+  async #awaitThreadWorkspace(
+    threadId: string,
+    environmentId: string,
+    expectedBranch: string,
+    expectedWorktreePath: string,
+  ): Promise<void> {
+    const deadline = Date.now() + this.#spawnVerificationTimeoutMs;
+    while (true) {
+      const status = await this.#loadThreadStatus(threadId, environmentId, false);
+      if (status.branch === expectedBranch && status.worktreePath === expectedWorktreePath) return;
+      const remainingMs = deadline - Date.now();
+      if (remainingMs <= 0) {
+        throw new OrchestratorError(
+          "MOVE_INCOMPLETE",
+          `T3 accepted the move for '${threadId}', but its workspace binding did not update. Retry with the same idempotency key.`,
+          {
+            threadId,
+            branch: status.branch,
+            worktreePath: status.worktreePath,
+            expectedBranch,
+            expectedWorktreePath,
+          },
+        );
+      }
+      await new Promise((resolve) => setTimeout(resolve, Math.min(250, remainingMs)));
     }
   }
 

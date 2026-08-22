@@ -224,6 +224,13 @@ export interface T3ThreadTurnStartCommand {
 export type T3ThreadCommand =
   | T3ThreadTurnStartCommand
   | {
+      readonly type: "thread.meta.update";
+      readonly commandId: string;
+      readonly threadId: string;
+      readonly branch: string | null;
+      readonly worktreePath: string | null;
+    }
+  | {
       readonly type: "thread.turn.interrupt";
       readonly commandId: string;
       readonly threadId: string;

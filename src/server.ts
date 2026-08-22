@@ -75,7 +75,7 @@ export function buildMcpServer(config: AppConfig): McpServer {
     {
       capabilities: { tools: {} },
       instructions:
-        "Create and manage real, visible agent threads in orchestration apps. Call list_platforms and orchestrator_status first, then list_projects and list_models before spawn_thread. Use exact provider instance IDs, model slugs, and advertised option values. Every state-changing tool requires a stable idempotency_key; reuse it only for an exact retry. workspace is always explicit on spawn_thread. Use get_thread_status or wait_for_thread to observe work, send_follow_up to continue it, interrupt_thread to stop the active turn, and stop_thread_session to stop all provider background work.",
+        "Create and manage real, visible agent threads in orchestration apps. Call list_platforms and orchestrator_status first, then list_projects and list_models before spawn_thread. Use exact provider instance IDs, model slugs, and advertised option values. Every state-changing tool requires a stable idempotency_key; reuse it only for an exact retry. workspace is always explicit on spawn_thread. Use get_thread_status or wait_for_thread to observe work, move_thread to bind an existing thread to another registered worktree, send_follow_up to continue it, interrupt_thread to stop the active turn, and stop_thread_session to stop all provider background work.",
     },
   );
 
@@ -109,6 +109,7 @@ export function buildMcpServer(config: AppConfig): McpServer {
             "list_threads",
             "spawn_thread",
             "wait_for_thread",
+            "move_thread",
             "send_follow_up",
             "interrupt_thread",
             "stop_thread_session",
@@ -376,6 +377,60 @@ export function buildMcpServer(config: AppConfig): McpServer {
             pollIntervalMs: poll_interval_ms,
             signal: context.mcpReq.signal,
           }) as unknown as Promise<Record<string, unknown>>,
+      ),
+  );
+
+  server.registerTool(
+    "move_thread",
+    {
+      title: "Move thread to worktree",
+      description:
+        "Idempotently bind an existing thread, including a currently running thread, to a different registered Git worktree in the same project. An in-flight turn keeps its current cwd; the next turn resumes in the destination worktree.",
+      inputSchema: z.object({
+        platform: platformInput,
+        thread_id: z.string().min(1).describe("Exact thread ID from spawn_thread or list_threads."),
+        worktree_path: z
+          .string()
+          .min(1)
+          .describe(
+            "Absolute path of an existing, branch-attached Git worktree for the thread's project.",
+          ),
+        idempotency_key: idempotencyKey,
+      }),
+      outputSchema: z.object({
+        platform: z.string(),
+        environmentId: z.string(),
+        projectId: z.string(),
+        threadId: z.string(),
+        previousBranch: z.string().nullable(),
+        previousWorktreePath: z.string().nullable(),
+        branch: z.string(),
+        worktreePath: z.string(),
+        worktreeDisposition: z.literal("adopted"),
+        dispatchSequence: z.number().nullable(),
+        deduplicated: z.boolean(),
+        inFlightTurnUnaffected: z.boolean(),
+        deepLink: z.string(),
+      }),
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
+    },
+    async ({ platform, thread_id, worktree_path, idempotency_key }) =>
+      runTool(
+        () =>
+          registry.get(platform).moveThread({
+            threadId: thread_id,
+            worktreePath: worktree_path,
+            idempotencyKey: idempotency_key,
+          }) as unknown as Promise<Record<string, unknown>>,
+        (value) =>
+          value.inFlightTurnUnaffected
+            ? `Moved thread ${String(value.threadId)}. Its in-flight turn was left untouched; the next turn will use the destination worktree.`
+            : `Moved thread ${String(value.threadId)} to ${String(value.worktreePath)}.`,
       ),
   );
 

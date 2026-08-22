@@ -171,6 +171,28 @@ export interface FollowUpInput {
   readonly idempotencyKey: string;
 }
 
+export interface MoveThreadInput {
+  readonly threadId: string;
+  readonly worktreePath: string;
+  readonly idempotencyKey: string;
+}
+
+export interface MoveThreadResult {
+  readonly platform: string;
+  readonly environmentId: string;
+  readonly projectId: string;
+  readonly threadId: string;
+  readonly previousBranch: string | null;
+  readonly previousWorktreePath: string | null;
+  readonly branch: string;
+  readonly worktreePath: string;
+  readonly worktreeDisposition: "adopted";
+  readonly dispatchSequence: number | null;
+  readonly deduplicated: boolean;
+  readonly inFlightTurnUnaffected: boolean;
+  readonly deepLink: string;
+}
+
 export interface ThreadCommandResult {
   readonly platform: string;
   readonly threadId: string;
@@ -206,6 +228,7 @@ export interface ThreadPlatformAdapter {
     readonly pollIntervalMs: number;
     readonly signal?: AbortSignal;
   }): Promise<WaitForThreadResult>;
+  moveThread(input: MoveThreadInput): Promise<MoveThreadResult>;
   sendFollowUp(input: FollowUpInput): Promise<ThreadCommandResult>;
   interruptThread(input: {
     readonly threadId: string;

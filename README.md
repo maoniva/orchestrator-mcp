@@ -16,6 +16,7 @@ This project uses the MCP TypeScript SDK v2 and modern Streamable HTTP (protocol
 - `spawn_thread` — idempotently creates a thread and starts its first turn
 - `get_thread_status` — execution phase, workspace binding, pending attention, plan progress, and latest assistant output
 - `wait_for_thread` — waits for turn completion or full background-work quiescence
+- `move_thread` — rebinds an existing thread to another registered Git worktree
 - `send_follow_up` — idempotently starts the next turn in an existing thread
 - `interrupt_thread` — interrupts the active turn without removing the thread
 - `stop_thread_session` — stops the provider session and background work
@@ -78,7 +79,7 @@ Any MCP client supporting Streamable HTTP can use the same endpoint. A useful ag
 2. Call `list_projects` and `list_models`; use the returned IDs and option values exactly.
 3. Choose `workspace.mode` explicitly and call `spawn_thread` with a stable idempotency key.
 4. Call `wait_for_thread`, or poll `get_thread_status` when the caller needs custom scheduling.
-5. Continue with `send_follow_up`, or use the interruption/session/lifecycle tools when needed.
+5. Continue with `send_follow_up`, or use the move/interruption/session/lifecycle tools when needed.
 
 Example `spawn_thread` arguments:
 
@@ -112,6 +113,17 @@ For worktree mode, `base_branch` is optional. When omitted, the adapter asks T3 
 
 The MCP prepares or adopts the worktree on the shared local filesystem before asking T3 to create the thread. This avoids T3's shorter per-Git-command timeout while still letting checkout hooks and setup work run for as long as the configured worktree and dispatch timeouts allow. An existing path is adopted only when it is the registered worktree for the exact requested local branch.
 
+To move an existing thread, call `move_thread` with its exact ID and the absolute path of another registered, branch-attached worktree for the same project. The destination is validated with `git worktree list` before T3's branch and path metadata are updated together. A running thread can move itself or another running thread; an already in-flight turn keeps its original cwd, and the provider session restarts or resumes in the destination on the next turn.
+
+```json
+{
+  "platform": "t3",
+  "thread_id": "thread-id-from-list_threads",
+  "worktree_path": "/Users/me/.t3/worktrees/ecosconnect/agent-payment-fix",
+  "idempotency_key": "move-payment-fix-v1"
+}
+```
+
 ### Idempotency
 
 Use a stable, caller-generated `idempotency_key` for one logical action, such as a ticket ID plus an operation/version suffix. Repeating the exact call with the same key does not create another thread or duplicate a follow-up. A deduplicated result has `deduplicated: true` and may have `dispatchSequence: null` because no new T3 command was sent.
@@ -120,7 +132,7 @@ For spawn, the effective project, prompt, model selection, modes, and workspace 
 
 A spawn is only reported as successful or deduplicated after T3 exposes the expected worktree binding and the exact initial message and turn. An interrupted partial bootstrap returns `SPAWN_INCOMPLETE`. `send_follow_up` refuses MCP-created worktree threads with a missing worktree path, preventing a silent fallback to the project checkout.
 
-For actions on an existing thread, keys are scoped to that action. Reuse a key only for an exact retry; use a new key for a new prompt or lifecycle transition. T3's persistent command receipts provide retry durability even though this MCP server itself stores no session or idempotency database.
+For actions on an existing thread, keys are scoped to that action. Reuse a key only for an exact retry; use a new key for a new prompt, move, or lifecycle transition. T3's persistent command receipts provide retry durability even though this MCP server itself stores no session or idempotency database.
 
 ### Waiting and lifecycle
 
@@ -178,7 +190,7 @@ Do not reuse the T3 bearer token as the inbound MCP bearer token, commit either 
 
 ## Architecture and next adapters
 
-The MCP-facing registry depends on a small `ThreadPlatformAdapter` interface. T3 uses authenticated HTTP for project/thread snapshots. Provider/model discovery and every mutation use short-lived authenticated WebSocket RPCs. For worktree spawns, the MCP first creates or safely adopts a T3-compatible local worktree, then gives T3 the already-bound branch and path so thread creation, setup, turns, and lifecycle remain native T3 orchestration operations. No connection is retained between MCP requests.
+The MCP-facing registry depends on a small `ThreadPlatformAdapter` interface. T3 uses authenticated HTTP for project/thread snapshots. Provider/model discovery and every mutation use short-lived authenticated WebSocket RPCs. For worktree spawns, the MCP first creates or safely adopts a T3-compatible local worktree, then gives T3 the already-bound branch and path. Moves adopt an existing registered worktree and dispatch T3's native thread metadata update. Thread creation, workspace changes, setup, turns, and lifecycle therefore remain native T3 orchestration operations. No connection is retained between MCP requests.
 
 A future adapter should implement status, project/workspace discovery, provider/model discovery, thread listing, spawn, waiting, and the lifecycle operations its native host genuinely supports. A host that cannot make a thread visible in its native app should report that limitation instead of pretending a subprocess is an app thread.
 

@@ -91,6 +91,7 @@ const serverConfig: T3ServerConfig = {
 
 class FakeWorktreePreparer implements WorktreePreparer {
   readonly calls: PrepareWorktreeInput[] = [];
+  readonly adoptCalls: Array<{ projectCwd: string; worktreePath: string }> = [];
   disposition: PreparedWorktree["disposition"] = "created";
 
   async prepare(input: PrepareWorktreeInput): Promise<PreparedWorktree> {
@@ -99,6 +100,18 @@ class FakeWorktreePreparer implements WorktreePreparer {
       path: `/worktrees/${input.branch.replaceAll("/", "-")}`,
       branch: input.branch,
       disposition: this.disposition,
+    };
+  }
+
+  async adopt(input: {
+    readonly projectCwd: string;
+    readonly worktreePath: string;
+  }): Promise<PreparedWorktree> {
+    this.adoptCalls.push(input);
+    return {
+      path: input.worktreePath,
+      branch: input.worktreePath.split("/").at(-1)!.replaceAll("-", "/"),
+      disposition: "adopted",
     };
   }
 }
@@ -261,6 +274,15 @@ class FakeClient implements T3ClientLike {
       const index = this.archivedThreads.findIndex((thread) => thread.id === command.threadId);
       const [thread] = index < 0 ? [] : this.archivedThreads.splice(index, 1);
       if (thread) this.activeThreads.push({ ...thread, archivedAt: null });
+    } else if (command.type === "thread.meta.update") {
+      const index = this.activeThreads.findIndex((thread) => thread.id === command.threadId);
+      if (index >= 0) {
+        this.activeThreads[index] = {
+          ...this.activeThreads[index]!,
+          branch: command.branch,
+          worktreePath: command.worktreePath,
+        };
+      }
     }
     return { sequence: 42 };
   }
@@ -556,6 +578,52 @@ describe("T3Adapter", () => {
       }),
     ).rejects.toThrow("Refusing to fall back to the project checkout");
     expect(client.commands).toHaveLength(1);
+  });
+
+  it("moves a running thread to an existing worktree and leaves its in-flight turn alone", async () => {
+    const client = new FakeClient();
+    const worktrees = new FakeWorktreePreparer();
+    const adapter = createAdapter(client, worktrees);
+    const spawned = await adapter.spawnThread(spawnInput());
+
+    const moved = await adapter.moveThread({
+      threadId: spawned.threadId,
+      worktreePath: "/worktrees/feature-payment-fix",
+      idempotencyKey: "move-payment-fix-v1",
+    });
+    const retry = await adapter.moveThread({
+      threadId: spawned.threadId,
+      worktreePath: "/worktrees/feature-payment-fix",
+      idempotencyKey: "move-payment-fix-v1",
+    });
+
+    expect(worktrees.adoptCalls).toEqual([
+      {
+        projectCwd: "/code/ecosconnect",
+        worktreePath: "/worktrees/feature-payment-fix",
+      },
+      {
+        projectCwd: "/code/ecosconnect",
+        worktreePath: "/worktrees/feature-payment-fix",
+      },
+    ]);
+    expect(client.commands[1]).toMatchObject({
+      type: "thread.meta.update",
+      threadId: spawned.threadId,
+      branch: "feature/payment/fix",
+      worktreePath: "/worktrees/feature-payment-fix",
+    });
+    expect(moved).toMatchObject({
+      previousBranch: null,
+      previousWorktreePath: null,
+      branch: "feature/payment/fix",
+      worktreePath: "/worktrees/feature-payment-fix",
+      dispatchSequence: 42,
+      deduplicated: false,
+      inFlightTurnUnaffected: true,
+    });
+    expect(retry).toMatchObject({ deduplicated: true, dispatchSequence: null });
+    expect(client.commands).toHaveLength(2);
   });
 
   it("skips invisible journaled thread IDs while preserving same-key retries", async () => {

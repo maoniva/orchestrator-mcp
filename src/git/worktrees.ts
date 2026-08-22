@@ -21,6 +21,10 @@ export interface PreparedWorktree {
 
 export interface WorktreePreparer {
   prepare(input: PrepareWorktreeInput): Promise<PreparedWorktree>;
+  adopt(input: {
+    readonly projectCwd: string;
+    readonly worktreePath: string;
+  }): Promise<PreparedWorktree>;
 }
 
 interface GitResult {
@@ -214,6 +218,48 @@ export class LocalGitWorktreePreparer implements WorktreePreparer {
       this.#timeoutMs,
     );
     return { ...adopted, disposition: "created" };
+  }
+
+  async adopt(input: {
+    readonly projectCwd: string;
+    readonly worktreePath: string;
+  }): Promise<PreparedWorktree> {
+    if (!path.isAbsolute(input.worktreePath)) {
+      throw new OrchestratorError(
+        "WORKTREE_PATH_NOT_ABSOLUTE",
+        `Worktree path '${input.worktreePath}' must be absolute.`,
+      );
+    }
+    const requestedPath = path.resolve(input.worktreePath);
+    const requestedCanonicalPath = await canonicalPath(requestedPath);
+    const projectCanonicalPath = await canonicalPath(input.projectCwd);
+    if (requestedCanonicalPath === projectCanonicalPath) {
+      throw new OrchestratorError(
+        "WORKTREE_PATH_IS_PROJECT",
+        `'${requestedPath}' is the project's primary checkout, not a linked worktree.`,
+      );
+    }
+
+    let match: ListedWorktree | undefined;
+    for (const worktree of await this.#list(input.projectCwd)) {
+      if ((await canonicalPath(worktree.path)) === requestedCanonicalPath) {
+        match = worktree;
+        break;
+      }
+    }
+    if (!match) {
+      throw new OrchestratorError(
+        "WORKTREE_NOT_FOUND",
+        `'${requestedPath}' is not a registered Git worktree for '${input.projectCwd}'.`,
+      );
+    }
+    if (match.branch === null) {
+      throw new OrchestratorError(
+        "WORKTREE_DETACHED",
+        `Worktree '${match.path}' is detached; move it onto a local branch before assigning a thread to it.`,
+      );
+    }
+    return { path: requestedPath, branch: match.branch, disposition: "adopted" };
   }
 
   async #list(cwd: string): Promise<readonly ListedWorktree[]> {
