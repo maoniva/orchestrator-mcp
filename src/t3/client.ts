@@ -8,12 +8,14 @@ import type {
   T3ShellSnapshot,
   T3ThreadCommand,
   T3ThreadDetailSnapshot,
+  T3VcsListRefsResult,
 } from "./types.js";
 
 interface T3ClientConfig {
   readonly baseUrl: string;
   readonly bearerToken?: string;
   readonly timeoutMs: number;
+  readonly dispatchTimeoutMs: number;
 }
 
 export interface T3ClientLike {
@@ -23,6 +25,7 @@ export interface T3ClientLike {
   getArchivedShellSnapshot(): Promise<T3ShellSnapshot>;
   getThreadSnapshot(threadId: string, turnLimit?: number): Promise<T3ThreadDetailSnapshot | null>;
   getServerConfig(): Promise<T3ServerConfig>;
+  getCurrentBranch(cwd: string): Promise<string | null>;
   dispatch(command: T3ThreadCommand): Promise<T3DispatchResult>;
 }
 
@@ -41,10 +44,45 @@ function describePayload(value: unknown): string | undefined {
   return undefined;
 }
 
+function describeRpcFailure(value: unknown): string | undefined {
+  const seen = new Set<unknown>();
+  const visit = (candidate: unknown): string | undefined => {
+    if (typeof candidate === "string" && candidate.trim() !== "") {
+      return candidate.trim().split("\n", 1)[0]!.slice(0, 500);
+    }
+    if (typeof candidate !== "object" || candidate === null || seen.has(candidate)) {
+      return undefined;
+    }
+    seen.add(candidate);
+    const record = candidate as Record<string, unknown>;
+    for (const key of ["message", "reason", "stderr", "description"]) {
+      const detail = visit(record[key]);
+      if (detail) {
+        const tag = typeof record._tag === "string" && record._tag.endsWith("Error")
+          ? `${record._tag}: `
+          : "";
+        return `${tag}${detail}`.slice(0, 500);
+      }
+    }
+    for (const key of ["cause", "error", "failure"]) {
+      const detail = visit(record[key]);
+      if (detail) return detail;
+    }
+    for (const [key, entry] of Object.entries(record)) {
+      if (key === "_tag") continue;
+      const detail = visit(entry);
+      if (detail) return detail;
+    }
+    return undefined;
+  };
+  return visit(value);
+}
+
 export class T3Client implements T3ClientLike {
   readonly baseUrl: string;
   readonly #bearerToken: string | undefined;
   readonly #timeoutMs: number;
+  readonly #dispatchTimeoutMs: number;
   readonly #fetch: FetchLike;
   readonly #webSocketFactory: WebSocketFactory;
 
@@ -58,6 +96,7 @@ export class T3Client implements T3ClientLike {
     this.baseUrl = config.baseUrl.replace(/\/$/, "");
     this.#bearerToken = config.bearerToken;
     this.#timeoutMs = config.timeoutMs;
+    this.#dispatchTimeoutMs = config.dispatchTimeoutMs;
     this.#fetch = dependencies.fetch ?? globalThis.fetch;
     this.#webSocketFactory = dependencies.webSocketFactory ?? ((url) => new WebSocket(url));
   }
@@ -100,11 +139,22 @@ export class T3Client implements T3ClientLike {
     return this.#singleRpc<T3ServerConfig>(await this.#webSocketUrl(), "server.getConfig", {});
   }
 
+  async getCurrentBranch(cwd: string): Promise<string | null> {
+    const result = await this.#singleRpc<T3VcsListRefsResult>(
+      await this.#webSocketUrl(),
+      "vcs.listRefs",
+      { cwd, refKind: "local", refresh: true, limit: 2 },
+    );
+    if (!result.isRepo) return null;
+    return result.refs.find((ref) => ref.current)?.name ?? null;
+  }
+
   async dispatch(command: T3ThreadCommand): Promise<T3DispatchResult> {
     return this.#singleRpc<T3DispatchResult>(
       await this.#webSocketUrl(),
       "orchestration.dispatchCommand",
       command,
+      this.#dispatchTimeoutMs,
     );
   }
 
@@ -179,7 +229,12 @@ export class T3Client implements T3ClientLike {
     return payload as T;
   }
 
-  #singleRpc<T>(url: string, tag: string, payload: unknown): Promise<T> {
+  #singleRpc<T>(
+    url: string,
+    tag: string,
+    payload: unknown,
+    timeoutMs = this.#timeoutMs,
+  ): Promise<T> {
     return new Promise<T>((resolve, reject) => {
       const socket = this.#webSocketFactory(url);
       const requestId = 0;
@@ -188,10 +243,10 @@ export class T3Client implements T3ClientLike {
         finish(
           new OrchestratorError(
             "T3_RPC_TIMEOUT",
-            `T3 RPC ${tag} did not respond within ${this.#timeoutMs}ms.`,
+            `T3 RPC ${tag} did not respond within ${timeoutMs}ms.`,
           ),
         );
-      }, this.#timeoutMs);
+      }, timeoutMs);
 
       const finish = (error?: unknown, value?: T) => {
         if (settled) return;
@@ -239,7 +294,14 @@ export class T3Client implements T3ClientLike {
           finish(undefined, exit.value as T);
           return;
         }
-        finish(new OrchestratorError("T3_RPC_FAILED", `T3 RPC ${tag} failed.`, exit));
+        const detail = describeRpcFailure(exit);
+        finish(
+          new OrchestratorError(
+            "T3_RPC_FAILED",
+            `T3 RPC ${tag} failed${detail ? `: ${detail}` : "."}`,
+            exit,
+          ),
+        );
       });
       socket.on("error", (error) => {
         finish(new OrchestratorError("T3_RPC_CONNECTION_FAILED", error.message));

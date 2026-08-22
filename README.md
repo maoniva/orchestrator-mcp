@@ -10,11 +10,11 @@ This project uses the MCP TypeScript SDK v2 and modern Streamable HTTP (protocol
 
 - `list_platforms` — configured thread hosts and capabilities
 - `orchestrator_status` — connection, authentication, and environment identity
-- `list_projects` — project IDs, paths, and default model selection
+- `list_projects` — project IDs, paths, current branches, and default model selection
 - `list_models` — live providers, models, authentication state, and option descriptors (including valid reasoning levels)
 - `list_threads` — visible T3 threads, optionally filtered by project and including archived threads
 - `spawn_thread` — idempotently creates a thread and starts its first turn
-- `get_thread_status` — execution phase, pending attention, plan progress, and latest assistant output
+- `get_thread_status` — execution phase, workspace binding, pending attention, plan progress, and latest assistant output
 - `wait_for_thread` — waits for turn completion or full background-work quiescence
 - `send_follow_up` — idempotently starts the next turn in an existing thread
 - `interrupt_thread` — interrupts the active turn without removing the thread
@@ -98,7 +98,7 @@ Example `spawn_thread` arguments:
     "mode": "worktree",
     "base_branch": "main",
     "branch": "agent/payment-fix",
-    "start_from_origin": true,
+    "start_from_origin": false,
     "run_setup_script": true
   }
 }
@@ -106,11 +106,19 @@ Example `spawn_thread` arguments:
 
 If `provider`, `model`, or model options are omitted, the project default is used when possible. With no project default, the first available provider and its default model are selected. There is intentionally no workspace default: every caller must choose either `{"mode":"project"}` or `worktree` explicitly.
 
+For worktree mode, `base_branch` is optional. When omitted, the adapter asks T3 for the branch currently checked out at the project's workspace root and uses that as the base. An explicit `base_branch` always wins. A detached checkout requires an explicit base.
+
+`start_from_origin` must be omitted or `false`; the tool schema rejects `true` before any Git or T3 side effect. MCP-managed worktrees always use a local ref because origin-based T3 thread startup is not reliable.
+
+The MCP prepares or adopts the worktree on the shared local filesystem before asking T3 to create the thread. This avoids T3's shorter per-Git-command timeout while still letting checkout hooks and setup work run for as long as the configured worktree and dispatch timeouts allow. An existing path is adopted only when it is the registered worktree for the exact requested local branch.
+
 ### Idempotency
 
 Use a stable, caller-generated `idempotency_key` for one logical action, such as a ticket ID plus an operation/version suffix. Repeating the exact call with the same key does not create another thread or duplicate a follow-up. A deduplicated result has `deduplicated: true` and may have `dispatchSequence: null` because no new T3 command was sent.
 
 For spawn, the effective project, prompt, model selection, modes, and workspace settings are fingerprinted into a deterministic thread ID. Reusing a spawn key with changed arguments therefore conflicts rather than silently targeting the original thread. Auto-generated worktree branch names are deterministic when an idempotency key is present.
+
+A spawn is only reported as successful or deduplicated after T3 exposes the expected worktree binding and the exact initial message and turn. An interrupted partial bootstrap returns `SPAWN_INCOMPLETE`. `send_follow_up` refuses MCP-created worktree threads with a missing worktree path, preventing a silent fallback to the project checkout.
 
 For actions on an existing thread, keys are scoped to that action. Reuse a key only for an exact retry; use a new key for a new prompt or lifecycle transition. T3's persistent command receipts provide retry durability even though this MCP server itself stores no session or idempotency database.
 
@@ -125,6 +133,25 @@ Both conditions return early with `attention_required` rather than hanging on an
 
 `interrupt_thread` targets the active turn. `stop_thread_session` is stronger: it stops provider background activity too. Archiving through `set_thread_lifecycle` is reversible and uses T3's native cleanup behavior; deletion is deliberately not exposed.
 
+## Installed macOS service
+
+On this machine, the server is installed as the user LaunchAgent `com.avinoam.orchestrator-mcp`. It runs [`scripts/run-local-service.zsh`](scripts/run-local-service.zsh), which starts `npm run dev`, obtains a T3 credential at runtime, and rotates that credential weekly.
+
+Because it uses `tsx watch`, saved changes under `src/` restart the HTTP server automatically. Connected MCP clients may need an MCP reconnect or app/window reload to rediscover added, removed, or renamed tools. Dependency changes still require `npm install`.
+
+```bash
+# Check service health
+curl http://127.0.0.1:3939/healthz
+
+# Restart it manually
+launchctl kickstart -k gui/$(id -u)/com.avinoam.orchestrator-mcp
+
+# Follow logs
+tail -f ~/Library/Logs/orchestrator-mcp.log
+```
+
+The shared endpoint is registered globally as `orchestrator` in Codex, Claude Code, and Cursor.
+
 ## Configuration
 
 | Variable | Default | Purpose |
@@ -132,6 +159,9 @@ Both conditions return early with `attention_required` rather than hanging on an
 | `T3_BASE_URL` | `http://127.0.0.1:3773` | Running T3 Code server |
 | `T3_BEARER_TOKEN` | — | T3 session token required for discovery and dispatch |
 | `T3_REQUEST_TIMEOUT_MS` | `15000` | Per-request upstream timeout |
+| `T3_DISPATCH_TIMEOUT_MS` | `1800000` | Long-running T3 mutation timeout; includes project setup scripts |
+| `T3_WORKTREE_TIMEOUT_MS` | `1800000` | Timeout for MCP-managed `git worktree add`, including checkout hooks |
+| `T3_WORKTREES_DIR` | `~/.t3/worktrees` | Root used for T3-compatible managed worktree paths |
 | `ORCHESTRATOR_HOST` | `127.0.0.1` | MCP bind address |
 | `ORCHESTRATOR_PORT` | `3939` | MCP port |
 | `ORCHESTRATOR_MCP_BEARER_TOKEN` | — | Optional inbound MCP bearer token; required off-loopback |
@@ -148,7 +178,7 @@ Do not reuse the T3 bearer token as the inbound MCP bearer token, commit either 
 
 ## Architecture and next adapters
 
-The MCP-facing registry depends on a small `ThreadPlatformAdapter` interface. T3 uses authenticated HTTP for project/thread snapshots. Provider/model discovery and every mutation use short-lived authenticated WebSocket RPCs so bootstrap worktrees and lifecycle cleanup follow T3's native orchestration path. No connection is retained between MCP requests.
+The MCP-facing registry depends on a small `ThreadPlatformAdapter` interface. T3 uses authenticated HTTP for project/thread snapshots. Provider/model discovery and every mutation use short-lived authenticated WebSocket RPCs. For worktree spawns, the MCP first creates or safely adopts a T3-compatible local worktree, then gives T3 the already-bound branch and path so thread creation, setup, turns, and lifecycle remain native T3 orchestration operations. No connection is retained between MCP requests.
 
 A future adapter should implement status, project/workspace discovery, provider/model discovery, thread listing, spawn, waiting, and the lifecycle operations its native host genuinely supports. A host that cannot make a thread visible in its native app should report that limitation instead of pretending a subprocess is an app thread.
 

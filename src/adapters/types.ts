@@ -15,6 +15,7 @@ export interface ProjectSummary {
   readonly id: string;
   readonly title: string;
   readonly workspaceRoot: string;
+  readonly currentBranch: string | null;
   readonly defaultModelSelection: {
     readonly provider: string;
     readonly model: string;
@@ -76,7 +77,7 @@ export interface SpawnThreadInput {
     | { readonly mode: "project" }
     | {
         readonly mode: "worktree";
-        readonly baseBranch: string;
+        readonly baseBranch?: string;
         readonly branch?: string;
         readonly startFromOrigin: boolean;
         readonly runSetupScript: boolean;
@@ -92,7 +93,10 @@ export interface SpawnThreadResult {
   readonly provider: string;
   readonly model: string;
   readonly options: Readonly<Record<string, string | boolean>>;
+  readonly baseBranch: string | null;
   readonly branch: string | null;
+  readonly worktreePath: string | null;
+  readonly worktreeDisposition: "created" | "adopted" | null;
   readonly workspaceMode: "project" | "worktree";
   readonly dispatchSequence: number | null;
   readonly deduplicated: boolean;
@@ -127,6 +131,9 @@ export interface ThreadStatusResult {
   readonly model: string;
   readonly runtimeMode: RuntimeMode;
   readonly interactionMode: InteractionMode;
+  readonly branch: string | null;
+  readonly worktreePath: string | null;
+  readonly workspaceState: "project" | "worktree" | "incomplete";
   readonly session: {
     readonly status: string;
     readonly activeTurnId: string | null;

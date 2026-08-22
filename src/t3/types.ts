@@ -155,6 +155,16 @@ export interface T3DispatchResult {
   readonly sequence: number;
 }
 
+export interface T3VcsRef {
+  readonly name: string;
+  readonly current: boolean;
+}
+
+export interface T3VcsListRefsResult {
+  readonly refs: readonly T3VcsRef[];
+  readonly isRepo: boolean;
+}
+
 export interface T3Message {
   readonly id: string;
   readonly role: "user" | "assistant" | "system";

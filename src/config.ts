@@ -1,4 +1,6 @@
 import { isIP } from "node:net";
+import { homedir } from "node:os";
+import { join } from "node:path";
 
 export interface AppConfig {
   readonly host: string;
@@ -9,6 +11,9 @@ export interface AppConfig {
     readonly baseUrl: string;
     readonly bearerToken?: string;
     readonly timeoutMs: number;
+    readonly dispatchTimeoutMs: number;
+    readonly worktreesDir: string;
+    readonly worktreeTimeoutMs: number;
   };
 }
 
@@ -72,6 +77,17 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
         env.T3_REQUEST_TIMEOUT_MS,
         15_000,
         "T3_REQUEST_TIMEOUT_MS",
+      ),
+      dispatchTimeoutMs: parsePositiveInteger(
+        env.T3_DISPATCH_TIMEOUT_MS,
+        1_800_000,
+        "T3_DISPATCH_TIMEOUT_MS",
+      ),
+      worktreesDir: env.T3_WORKTREES_DIR?.trim() || join(homedir(), ".t3", "worktrees"),
+      worktreeTimeoutMs: parsePositiveInteger(
+        env.T3_WORKTREE_TIMEOUT_MS,
+        1_800_000,
+        "T3_WORKTREE_TIMEOUT_MS",
       ),
     },
   };

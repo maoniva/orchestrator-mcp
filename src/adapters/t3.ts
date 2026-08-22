@@ -1,6 +1,7 @@
 import { createHash, randomBytes } from "node:crypto";
 
 import { OrchestratorError } from "../errors.js";
+import type { PreparedWorktree, WorktreePreparer } from "../git/worktrees.js";
 import type { T3ClientLike } from "../t3/client.js";
 import type {
   ModelSelection,
@@ -27,6 +28,8 @@ import type {
 
 const TITLE_MAX_LENGTH = 80;
 const REASONING_OPTION_IDS = ["reasoningEffort", "effort"] as const;
+const MAX_PHANTOM_THREAD_ATTEMPTS = 8;
+const DEFAULT_SPAWN_VERIFICATION_TIMEOUT_MS = 15_000;
 
 function optionsToRecord(
   options: ModelSelection["options"],
@@ -63,6 +66,32 @@ function deepLink(environmentId: string, threadId: string): string {
   return `/threads/${encodeURIComponent(environmentId)}/${encodeURIComponent(threadId)}`;
 }
 
+function isDeterministicSpawnId(threadId: string): boolean {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+    threadId,
+  );
+}
+
+function workspaceState(thread: T3ThreadShell): ThreadStatusResult["workspaceState"] {
+  if (isDeterministicSpawnId(thread.id) && thread.latestTurn == null) return "incomplete";
+  if (thread.worktreePath !== null && thread.branch !== null) return "worktree";
+  if (
+    isDeterministicSpawnId(thread.id) &&
+    thread.branch !== null &&
+    thread.worktreePath === null
+  ) {
+    return "incomplete";
+  }
+  return "project";
+}
+
+function isPhantomThreadInvariant(error: unknown): boolean {
+  return (
+    error instanceof Error &&
+    error.message.includes("already exists and cannot be created twice")
+  );
+}
+
 function abortableDelay(ms: number, signal?: AbortSignal): Promise<void> {
   return new Promise((resolve, reject) => {
     if (signal?.aborted) {
@@ -82,12 +111,13 @@ function abortableDelay(ms: number, signal?: AbortSignal): Promise<void> {
   });
 }
 
-function projectSummary(project: T3ProjectShell): ProjectSummary {
+function projectSummary(project: T3ProjectShell, currentBranch: string | null = null): ProjectSummary {
   const selection = project.defaultModelSelection;
   return {
     id: project.id,
     title: project.title,
     workspaceRoot: project.workspaceRoot,
+    currentBranch,
     defaultModelSelection:
       selection === null
         ? null
@@ -143,7 +173,7 @@ function resolveProject(projects: readonly T3ProjectShell[], selector: string): 
     throw new OrchestratorError(
       "PROJECT_AMBIGUOUS",
       `Project selector '${selector}' matched multiple projects; use the project ID.`,
-      matches.map(projectSummary),
+      matches.map((project) => projectSummary(project)),
     );
   }
   throw new OrchestratorError(
@@ -360,10 +390,20 @@ export class T3Adapter implements ThreadPlatformAdapter {
   readonly name = "T3 Code";
   readonly #client: T3ClientLike;
   readonly #configured: boolean;
+  readonly #worktrees: WorktreePreparer;
+  readonly #spawnVerificationTimeoutMs: number;
 
-  constructor(client: T3ClientLike, configured: boolean) {
+  constructor(
+    client: T3ClientLike,
+    configured: boolean,
+    worktrees: WorktreePreparer,
+    options: { readonly spawnVerificationTimeoutMs?: number } = {},
+  ) {
     this.#client = client;
     this.#configured = configured;
+    this.#worktrees = worktrees;
+    this.#spawnVerificationTimeoutMs =
+      options.spawnVerificationTimeoutMs ?? DEFAULT_SPAWN_VERIFICATION_TIMEOUT_MS;
   }
 
   isConfigured(): boolean {
@@ -398,7 +438,11 @@ export class T3Adapter implements ThreadPlatformAdapter {
 
   async listProjects(): Promise<readonly ProjectSummary[]> {
     const snapshot = await this.#client.getShellSnapshot();
-    return snapshot.projects.map(projectSummary);
+    return Promise.all(
+      snapshot.projects.map(async (project) =>
+        projectSummary(project, await this.#client.getCurrentBranch(project.workspaceRoot)),
+      ),
+    );
   }
 
   async listProviders(): Promise<readonly ProviderSummary[]> {
@@ -448,9 +492,35 @@ export class T3Adapter implements ThreadPlatformAdapter {
     const selection = resolveSelection(project, config.providers, input);
     const title = (input.title?.trim() || defaultTitle(input.prompt)).slice(0, TITLE_MAX_LENGTH);
     const createdAt = new Date().toISOString();
+    const baseBranch =
+      input.workspace.mode === "worktree"
+        ? input.workspace.baseBranch?.trim() ||
+          (await this.#client.getCurrentBranch(project.workspaceRoot))
+        : null;
+    if (input.workspace.mode === "worktree" && baseBranch === null) {
+      throw new OrchestratorError(
+        "CURRENT_BRANCH_UNAVAILABLE",
+        `Project '${project.title}' is not on a local branch; specify workspace.base_branch explicitly.`,
+      );
+    }
+    if (input.workspace.mode === "worktree" && input.workspace.startFromOrigin) {
+      throw new OrchestratorError(
+        "START_FROM_ORIGIN_DISABLED",
+        "start_from_origin is disabled because T3 sessions on origin-based worktrees are unstable. Use the local checked-out branch or specify a local base_branch.",
+      );
+    }
     const branch =
       input.workspace.mode === "worktree"
         ? input.workspace.branch?.trim() || branchSlug(title, input.idempotencyKey)
+        : null;
+    const preparedWorktree: PreparedWorktree | null =
+      input.workspace.mode === "worktree"
+        ? await this.#worktrees.prepare({
+            projectCwd: project.workspaceRoot,
+            baseBranch: baseBranch!,
+            branch: branch!,
+            startFromOrigin: input.workspace.startFromOrigin,
+          })
         : null;
     const effectiveRequest = stableStringify({
       projectId: project.id,
@@ -464,102 +534,128 @@ export class T3Adapter implements ThreadPlatformAdapter {
           ? { mode: "project" }
           : {
               mode: "worktree",
-              baseBranch: input.workspace.baseBranch,
+              baseBranch,
               branch,
               startFromOrigin: input.workspace.startFromOrigin,
               runSetupScript: input.workspace.runSetupScript,
             },
     });
-    const threadId = deterministicUuid(
-      "orchestrator-mcp:t3:spawn-thread",
-      `${input.idempotencyKey}\0${effectiveRequest}`,
-    );
-    const commandId = deterministicUuid(
-      "orchestrator-mcp:t3:spawn-command",
-      input.idempotencyKey,
-    );
-
-    const toResult = (dispatchSequence: number | null, deduplicated: boolean) => ({
-      platform: this.id,
-      environmentId: config.environment.environmentId,
-      projectId: project.id,
-      threadId,
-      title,
-      provider: selection.instanceId,
-      model: selection.model,
-      options: optionsToRecord(selection.options),
-      branch,
-      workspaceMode: input.workspace.mode,
-      dispatchSequence,
-      deduplicated,
-      deepLink: deepLink(config.environment.environmentId, threadId),
-    });
-
-    const activeExisting = snapshot.threads.some((thread) => thread.id === threadId);
-    if (activeExisting) return toResult(null, true);
-    const archived = await this.#client.getArchivedShellSnapshot();
-    if (archived.threads.some((thread) => thread.id === threadId)) return toResult(null, true);
-
-    const command: T3ThreadTurnStartCommand = {
-      type: "thread.turn.start",
-      commandId,
-      threadId,
-      message: {
-        messageId: deterministicUuid(
-          "orchestrator-mcp:t3:spawn-message",
-          `${input.idempotencyKey}\0${effectiveRequest}`,
-        ),
-        role: "user",
-        text: input.prompt,
-        attachments: [],
-      },
-      modelSelection: selection,
-      titleSeed: title,
-      runtimeMode: input.runtimeMode,
-      interactionMode: input.interactionMode,
-      bootstrap: {
-        createThread: {
-          projectId: project.id,
-          title,
-          modelSelection: selection,
-          runtimeMode: input.runtimeMode,
-          interactionMode: input.interactionMode,
-          branch: input.workspace.mode === "worktree" ? input.workspace.baseBranch : null,
-          worktreePath: null,
-          createdAt,
-        },
-        ...(input.workspace.mode === "worktree"
-          ? {
-              prepareWorktree: {
-                projectCwd: project.workspaceRoot,
-                baseBranch: input.workspace.baseBranch,
-                branch: branch!,
-                ...(input.workspace.startFromOrigin ? { startFromOrigin: true } : {}),
-              },
-              runSetupScript: input.workspace.runSetupScript,
-            }
-          : {}),
-      },
-      createdAt,
-    };
-
-    try {
-      const result = await this.#client.dispatch(command);
-      return toResult(result.sequence, false);
-    } catch (error) {
-      // A concurrent retry can lose the bootstrap create race even though the
-      // first request succeeded. The deterministic thread ID is the durable
-      // idempotency record in that case.
-      const [activeAfterFailure, archivedAfterFailure] = await Promise.all([
-        this.#client.getShellSnapshot(),
-        this.#client.getArchivedShellSnapshot(),
-      ]);
-      const exists = [...activeAfterFailure.threads, ...archivedAfterFailure.threads].some(
-        (thread) => thread.id === threadId,
+    let lastPhantomError: unknown;
+    for (let attempt = 0; attempt < MAX_PHANTOM_THREAD_ATTEMPTS; attempt += 1) {
+      const attemptKey = `${input.idempotencyKey}\0${attempt}`;
+      const threadId = deterministicUuid(
+        "orchestrator-mcp:t3:spawn-thread:v2",
+        `${attemptKey}\0${effectiveRequest}`,
       );
-      if (exists) return toResult(null, true);
-      throw error;
+      const commandId = deterministicUuid("orchestrator-mcp:t3:spawn-command:v2", attemptKey);
+      const messageId = deterministicUuid(
+        "orchestrator-mcp:t3:spawn-message:v2",
+        `${attemptKey}\0${effectiveRequest}`,
+      );
+      const toResult = (dispatchSequence: number | null, deduplicated: boolean) => ({
+        platform: this.id,
+        environmentId: config.environment.environmentId,
+        projectId: project.id,
+        threadId,
+        title,
+        provider: selection.instanceId,
+        model: selection.model,
+        options: optionsToRecord(selection.options),
+        baseBranch,
+        branch,
+        worktreePath: preparedWorktree?.path ?? null,
+        worktreeDisposition: preparedWorktree?.disposition ?? null,
+        workspaceMode: input.workspace.mode,
+        dispatchSequence,
+        deduplicated,
+        deepLink: deepLink(config.environment.environmentId, threadId),
+      });
+
+      const existing = await this.#findSpawnedThread(threadId);
+      if (existing) {
+        await this.#awaitCompleteSpawn(
+          threadId,
+          input,
+          branch,
+          preparedWorktree?.path ?? null,
+          messageId,
+          existing,
+        );
+        return toResult(null, true);
+      }
+
+      const command: T3ThreadTurnStartCommand = {
+        type: "thread.turn.start",
+        commandId,
+        threadId,
+        message: {
+          messageId,
+          role: "user",
+          text: input.prompt,
+          attachments: [],
+        },
+        modelSelection: selection,
+        titleSeed: title,
+        runtimeMode: input.runtimeMode,
+        interactionMode: input.interactionMode,
+        bootstrap: {
+          createThread: {
+            projectId: project.id,
+            title,
+            modelSelection: selection,
+            runtimeMode: input.runtimeMode,
+            interactionMode: input.interactionMode,
+            branch,
+            worktreePath: preparedWorktree?.path ?? null,
+            createdAt,
+          },
+          ...(input.workspace.mode === "worktree"
+            ? { runSetupScript: input.workspace.runSetupScript }
+            : {}),
+        },
+        createdAt,
+      };
+
+      try {
+        const result = await this.#client.dispatch(command);
+        await this.#awaitCompleteSpawn(
+          threadId,
+          input,
+          branch,
+          preparedWorktree?.path ?? null,
+          messageId,
+        );
+        return toResult(result.sequence, false);
+      } catch (error) {
+        const existingAfterFailure = await this.#findSpawnedThread(threadId);
+        if (existingAfterFailure) {
+          try {
+            await this.#awaitCompleteSpawn(
+              threadId,
+              input,
+              branch,
+              preparedWorktree?.path ?? null,
+              messageId,
+              existingAfterFailure,
+            );
+            return toResult(null, true);
+          } catch (integrityError) {
+            if (integrityError instanceof OrchestratorError) throw integrityError;
+          }
+        }
+        if (isPhantomThreadInvariant(error)) {
+          lastPhantomError = error;
+          continue;
+        }
+        throw error;
+      }
     }
+
+    throw new OrchestratorError(
+      "SPAWN_PHANTOM_RETRY_EXHAUSTED",
+      `T3 rejected ${MAX_PHANTOM_THREAD_ATTEMPTS} deterministic thread IDs as already journaled but invisible. Use a new idempotency key.`,
+      lastPhantomError,
+    );
   }
 
   async getThreadStatus(
@@ -620,11 +716,18 @@ export class T3Adapter implements ThreadPlatformAdapter {
         `Thread '${input.threadId}' is archived; unarchive it before sending a follow-up.`,
       );
     }
+    if (status.workspaceState === "incomplete") {
+      throw new OrchestratorError(
+        "THREAD_WORKSPACE_INCOMPLETE",
+        `Thread '${input.threadId}' was created for a worktree but has no bound worktree path. Refusing to fall back to the project checkout.`,
+        { branch: status.branch, worktreePath: status.worktreePath },
+      );
+    }
     const messageId = deterministicUuid(
       "orchestrator-mcp:t3:follow-up-message",
       input.idempotencyKey,
     );
-    const existing = await this.#client.getThreadSnapshot(input.threadId, 20);
+    const existing = await this.#client.getThreadSnapshot(input.threadId);
     const existingMessage = existing?.thread.messages.find((message) => message.id === messageId);
     if (existingMessage) {
       if (existingMessage.text !== input.prompt) {
@@ -655,7 +758,7 @@ export class T3Adapter implements ThreadPlatformAdapter {
       createdAt,
     };
     const result = await this.#client.dispatch(command);
-    const after = await this.#client.getThreadSnapshot(input.threadId, 20);
+    const after = await this.#client.getThreadSnapshot(input.threadId);
     const persisted = after?.thread.messages.find((message) => message.id === messageId);
     if (persisted && persisted.text !== input.prompt) {
       throw new OrchestratorError(
@@ -815,6 +918,9 @@ export class T3Adapter implements ThreadPlatformAdapter {
       model: thread.modelSelection.model,
       runtimeMode: thread.runtimeMode,
       interactionMode: thread.interactionMode,
+      branch: thread.branch,
+      worktreePath: thread.worktreePath,
+      workspaceState: workspaceState(thread),
       session:
         thread.session === null
           ? null
@@ -841,6 +947,104 @@ export class T3Adapter implements ThreadPlatformAdapter {
       updatedAt: thread.updatedAt,
       deepLink: deepLink(environmentId, thread.id),
     };
+  }
+
+  async #findSpawnedThread(threadId: string): Promise<T3ThreadShell | null> {
+    // The shell projection can briefly lag a successful dispatch. The per-thread
+    // endpoint reads the freshly persisted aggregate and is therefore the
+    // authoritative source for spawn verification and exact retries.
+    const detail = await this.#client.getThreadSnapshot(threadId);
+    if (detail) return detail.thread;
+    const active = await this.#client.getShellSnapshot();
+    const activeThread = active.threads.find((thread) => thread.id === threadId);
+    if (activeThread) return activeThread;
+    const archived = await this.#client.getArchivedShellSnapshot();
+    return archived.threads.find((thread) => thread.id === threadId) ?? null;
+  }
+
+  async #requireCompleteSpawn(
+    thread: T3ThreadShell,
+    input: SpawnThreadInput,
+    expectedBranch: string | null,
+    expectedWorktreePath: string | null,
+    messageId: string,
+  ): Promise<void> {
+    const problems: string[] = [];
+    if (input.workspace.mode === "worktree") {
+      if (thread.worktreePath === null) problems.push("worktreePath is null");
+      if (thread.branch !== expectedBranch) {
+        problems.push(`branch is '${thread.branch ?? "null"}', expected '${expectedBranch}'`);
+      }
+      if (thread.worktreePath !== expectedWorktreePath) {
+        problems.push(
+          `worktreePath is '${thread.worktreePath ?? "null"}', expected '${expectedWorktreePath}'`,
+        );
+      }
+    }
+    const detail = await this.#client.getThreadSnapshot(thread.id);
+    const message = detail?.thread.messages.find((candidate) => candidate.id === messageId);
+    if (!message) problems.push("initial prompt is not persisted");
+    else if (message.text !== input.prompt) problems.push("initial prompt does not match");
+    if (thread.latestTurn == null) problems.push("initial turn was not requested");
+    if (problems.length === 0) return;
+
+    throw new OrchestratorError(
+      "SPAWN_INCOMPLETE",
+      `T3 left thread '${thread.id}' in an incomplete bootstrap state (${problems.join(
+        "; ",
+      )}). No follow-up was sent; clean up or repair the thread/worktree, then spawn with a new idempotency key.`,
+      {
+        threadId: thread.id,
+        branch: thread.branch,
+        worktreePath: thread.worktreePath,
+        problems,
+      },
+    );
+  }
+
+  async #awaitCompleteSpawn(
+    threadId: string,
+    input: SpawnThreadInput,
+    expectedBranch: string | null,
+    expectedWorktreePath: string | null,
+    messageId: string,
+    initialThread?: T3ThreadShell,
+  ): Promise<T3ThreadShell> {
+    const deadline = Date.now() + this.#spawnVerificationTimeoutMs;
+    let thread: T3ThreadShell | null = initialThread ?? null;
+    let lastIntegrityError: OrchestratorError | null = null;
+
+    while (true) {
+      thread ??= await this.#findSpawnedThread(threadId);
+      if (thread) {
+        try {
+          await this.#requireCompleteSpawn(
+            thread,
+            input,
+            expectedBranch,
+            expectedWorktreePath,
+            messageId,
+          );
+          return thread;
+        } catch (error) {
+          if (!(error instanceof OrchestratorError) || error.code !== "SPAWN_INCOMPLETE") {
+            throw error;
+          }
+          lastIntegrityError = error;
+        }
+      }
+
+      const remainingMs = deadline - Date.now();
+      if (remainingMs <= 0) {
+        if (lastIntegrityError) throw lastIntegrityError;
+        throw new OrchestratorError(
+          "SPAWN_NOT_PERSISTED",
+          `T3 accepted the spawn for '${threadId}' but the thread is not visible yet. Retry with the same idempotency key.`,
+        );
+      }
+      await new Promise((resolve) => setTimeout(resolve, Math.min(250, remainingMs)));
+      thread = null;
+    }
   }
 
   #commandResult(

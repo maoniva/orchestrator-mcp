@@ -6,6 +6,7 @@ import { errorMessage } from "./errors.js";
 import { T3Adapter } from "./adapters/t3.js";
 import type { SpawnThreadInput } from "./adapters/types.js";
 import { AdapterRegistry } from "./registry.js";
+import { LocalGitWorktreePreparer } from "./git/worktrees.js";
 import { T3Client } from "./t3/client.js";
 
 const platformInput = z
@@ -56,7 +57,15 @@ async function runTool(
 
 export function createRegistry(config: AppConfig): AdapterRegistry {
   const client = new T3Client(config.t3);
-  return new AdapterRegistry([new T3Adapter(client, config.t3.bearerToken !== undefined)]);
+  const worktrees = new LocalGitWorktreePreparer({
+    worktreesDir: config.t3.worktreesDir,
+    timeoutMs: config.t3.worktreeTimeoutMs,
+  });
+  return new AdapterRegistry([
+    new T3Adapter(client, config.t3.bearerToken !== undefined, worktrees, {
+      spawnVerificationTimeoutMs: config.t3.timeoutMs,
+    }),
+  ]);
 }
 
 export function buildMcpServer(config: AppConfig): McpServer {
@@ -128,7 +137,7 @@ export function buildMcpServer(config: AppConfig): McpServer {
     {
       title: "List projects",
       description:
-        "List projects that can own a new thread, including IDs, workspace roots, and default models.",
+        "List projects that can own a new thread, including IDs, workspace roots, currently checked-out branches, and default models.",
       inputSchema: z.object({ platform: platformInput }),
       outputSchema: z.object({ platform: z.string(), projects: z.array(z.unknown()) }),
       annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
@@ -218,14 +227,17 @@ export function buildMcpServer(config: AppConfig): McpServer {
             z.object({ mode: z.literal("project") }),
             z.object({
               mode: z.literal("worktree"),
-              base_branch: z.string().min(1),
+              base_branch: z.string().min(1).optional(),
               branch: z.string().min(1).optional(),
-              start_from_origin: z.boolean().default(false),
+              start_from_origin: z
+                .literal(false)
+                .default(false)
+                .describe("Must remain false; worktrees are always created from a local ref."),
               run_setup_script: z.boolean().default(true),
             }),
           ])
           .describe(
-            "Required: explicitly run in the project's current checkout or prepare an isolated git worktree from base_branch.",
+            "Required: explicitly run in the project's current checkout or prepare an isolated git worktree. A worktree defaults to the project's currently checked-out branch when base_branch is omitted.",
           ),
       }),
       outputSchema: z.object({
@@ -237,7 +249,10 @@ export function buildMcpServer(config: AppConfig): McpServer {
         provider: z.string(),
         model: z.string(),
         options: z.record(z.string(), modelOptionValue),
+        baseBranch: z.string().nullable(),
         branch: z.string().nullable(),
+        worktreePath: z.string().nullable(),
+        worktreeDisposition: z.enum(["created", "adopted"]).nullable(),
         workspaceMode: z.enum(["project", "worktree"]),
         dispatchSequence: z.number().nullable(),
         deduplicated: z.boolean(),
@@ -280,7 +295,9 @@ export function buildMcpServer(config: AppConfig): McpServer {
             ? { mode: "project" }
             : {
                 mode: "worktree",
-                baseBranch: workspace.base_branch,
+                ...(workspace.base_branch === undefined
+                  ? {}
+                  : { baseBranch: workspace.base_branch }),
                 ...(workspace.branch === undefined ? {} : { branch: workspace.branch }),
                 startFromOrigin: workspace.start_from_origin,
                 runSetupScript: workspace.run_setup_script,

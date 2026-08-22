@@ -11,6 +11,9 @@ const config: AppConfig = {
   t3: {
     baseUrl: "http://127.0.0.1:3773",
     timeoutMs: 1_000,
+    dispatchTimeoutMs: 2_000,
+    worktreesDir: "/tmp/orchestrator-mcp-test-worktrees",
+    worktreeTimeoutMs: 2_000,
   },
 };
 
@@ -56,6 +59,8 @@ describe("MCP v2 handler", () => {
     expect(spawn?.inputSchema).toMatchObject({
       required: expect.arrayContaining(["idempotency_key", "project", "prompt", "workspace"]),
     });
+    expect(JSON.stringify(spawn?.inputSchema)).toContain('"start_from_origin"');
+    expect(JSON.stringify(spawn?.inputSchema)).toContain('"const":false');
     expect(result.structuredContent).toEqual({
       platforms: [
         {
